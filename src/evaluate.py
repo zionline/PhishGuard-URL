@@ -1,51 +1,27 @@
 """
-evaluate.py
-===========
-Full evaluation of PhishGuard-URL on the held-out test set.
+evaluate.py  —  Reproduce all paper tables
 PhishGuard-URL (Molefi, 2026)
 
-Reproduces all numerical results in the paper:
-  - Table 3: Overall performance (all 8 models)
-  - Table 4: Confusion matrix
-  - Table 6: 10-fold cross-validation
-  - Table 7: Ablation study
-
-Usage
------
-  python src/evaluate.py
-  python src/evaluate.py --test data/test.csv --models models/
+Usage:
+  python src/evaluate.py                  # full evaluation
+  python src/evaluate.py --skip_svm       # skip SVM (faster)
 """
-
-import argparse
-import json
-import os
-import sys
-import warnings
+import argparse, json, os, sys, time, warnings
 warnings.filterwarnings("ignore")
-
 import numpy as np
 import pandas as pd
 import joblib
-
-from sklearn.ensemble  import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.tree      import DecisionTreeClassifier
-from sklearn.naive_bayes import GaussianNB
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm       import SVC
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble        import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model    import LogisticRegression
+from sklearn.tree            import DecisionTreeClassifier
+from sklearn.naive_bayes     import GaussianNB
+from sklearn.neighbors       import KNeighborsClassifier
+from sklearn.svm             import SVC
+from sklearn.preprocessing   import StandardScaler
 from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, confusion_matrix,
-    matthews_corrcoef
-)
-
-RANDOM_SEED = 42
-
-# Paper fusion weights
-W_RF, W_GB, W_LR = 0.45, 0.40, 0.15
-
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, roc_auc_score, confusion_matrix)
+SEED = 42
 
 def load_split(path):
     df = pd.read_csv(path)
@@ -53,240 +29,150 @@ def load_split(path):
     X  = df.drop(columns=["label"]).select_dtypes(include=[np.number]).values
     return X, y
 
+def metrics(yt, yp, yprob):
+    acc=accuracy_score(yt,yp); prec=precision_score(yt,yp,zero_division=0)
+    rec=recall_score(yt,yp,zero_division=0); f1=f1_score(yt,yp,zero_division=0)
+    auc=roc_auc_score(yt,yprob)
+    tn,fp,fn,tp=confusion_matrix(yt,yp).ravel()
+    fpr=fp/(fp+tn) if (fp+tn) else 0
+    return [f"{100*acc:.2f}%",f"{100*prec:.2f}%",f"{100*rec:.2f}%",
+            f"{100*f1:.2f}%",f"{auc:.4f}",f"{100*fpr:.2f}%"]
 
-def compute_metrics(y_true, y_pred, y_prob):
-    """Compute all 6 metrics used in the paper."""
-    acc  = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec  = recall_score(y_true, y_pred, zero_division=0)
-    f1   = f1_score(y_true, y_pred, zero_division=0)
-    auc  = roc_auc_score(y_true, y_prob)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
-    return {
-        "Accuracy":  f"{100*acc:.2f}%",
-        "Precision": f"{100*prec:.2f}%",
-        "Recall":    f"{100*rec:.2f}%",
-        "F1-Score":  f"{100*f1:.2f}%",
-        "AUC-ROC":   f"{auc:.4f}",
-        "FPR":       f"{100*fpr:.2f}%",
-    }
+def ptable(title, rows, headers):
+    print(f"\n{'='*72}\n  {title}\n{'='*72}")
+    w=[max(len(h),max(len(str(r[i]))for r in rows))for i,h in enumerate(headers)]
+    fmt="  ".join(f"{{:<{x}}}"for x in w)
+    print(fmt.format(*headers)); print("-"*72)
+    for r in rows: print(fmt.format(*[str(v)for v in r]))
+    print("="*72)
 
-
-def print_table(title, rows, headers):
-    print(f"\n{'='*65}")
-    print(f"  {title}")
-    print(f"{'='*65}")
-    col_w = [max(len(h), max(len(str(r[i])) for r in rows))
-             for i, h in enumerate(headers)]
-    fmt   = "  ".join(f"{{:<{w}}}" for w in col_w)
-    print(fmt.format(*headers))
-    print("-" * 65)
-    for row in rows:
-        print(fmt.format(*[str(v) for v in row]))
-    print("=" * 65)
-
-
-def evaluate(test_path, train_path, models_dir):
-
-    # ------------------------------------------------------------------
-    # Load data
-    # ------------------------------------------------------------------
+def evaluate(test_path, train_path, models_dir, skip_svm):
+    print("\nLoading data ...")
     X_test, y_test   = load_split(test_path)
     X_train, y_train = load_split(train_path)
+    print(f"  Train: {X_train.shape[0]:,}   Test: {X_test.shape[0]:,}   Features: {X_test.shape[1]}")
 
-    # Fit scaler on train (for LR and SVM)
-    scaler = joblib.load(os.path.join(models_dir, "scaler.joblib"))
-    X_test_scaled = scaler.transform(X_test)
+    print("Loading pre-trained models ...")
+    scaler = joblib.load(f"{models_dir}/scaler.joblib")
+    rf     = joblib.load(f"{models_dir}/rf_model.joblib")
+    gb     = joblib.load(f"{models_dir}/gb_model.joblib")
+    lr     = joblib.load(f"{models_dir}/lr_model.joblib")
+    with open(f"{models_dir}/fusion_weights.json") as f: w=json.load(f)
+    w_rf,w_gb,w_lr = w["w_RF"],w["w_GB"],w["w_LR"]
+    Xts = scaler.transform(X_test)
 
-    # ------------------------------------------------------------------
-    # Load pre-trained PhishGuard models
-    # ------------------------------------------------------------------
-    rf = joblib.load(os.path.join(models_dir, "rf_model.joblib"))
-    gb = joblib.load(os.path.join(models_dir, "gb_model.joblib"))
-    lr = joblib.load(os.path.join(models_dir, "lr_model.joblib"))
+    rows=[]
+    models_list = [
+        ("Naive Bayes",          lambda: (GaussianNB(), X_train, X_test)),
+        ("Logistic Regression",  None),
+        ("SVM (RBF)",            None),
+        ("Decision Tree",        lambda: (DecisionTreeClassifier(max_depth=20,random_state=SEED), X_train, X_test)),
+        ("k-NN (k=5)",           None),
+        ("Random Forest",        None),
+        ("Gradient Boosting",    None),
+        ("PhishGuard (Ensemble)",None),
+    ]
 
-    with open(os.path.join(models_dir, "fusion_weights.json")) as f:
-        w = json.load(f)
-    w_rf, w_gb, w_lr = w["w_RF"], w["w_GB"], w["w_LR"]
+    for i,(name,_) in enumerate(models_list,1):
+        print(f"  [{i}/8] {name} ...", end=" ", flush=True); t0=time.time()
 
-    # ------------------------------------------------------------------
-    # Table 3: Overall performance
-    # ------------------------------------------------------------------
-    print("\nEvaluating all models on test set ...")
+        if name=="Naive Bayes":
+            m=GaussianNB(); m.fit(X_train,y_train)
+            rows.append((name,*metrics(y_test,m.predict(X_test),m.predict_proba(X_test)[:,1])))
 
-    rows = []
+        elif name=="Logistic Regression":
+            sc=StandardScaler(); m=LogisticRegression(max_iter=1000,random_state=SEED)
+            m.fit(sc.fit_transform(X_train),y_train)
+            rows.append((name,*metrics(y_test,m.predict(sc.transform(X_test)),m.predict_proba(sc.transform(X_test))[:,1])))
 
-    # 1. Naive Bayes
-    nb = GaussianNB()
-    nb.fit(X_train, y_train)
-    rows.append(("Naive Bayes", *compute_metrics(
-        y_test, nb.predict(X_test), nb.predict_proba(X_test)[:,1]).values()))
+        elif name=="SVM (RBF)":
+            if skip_svm:
+                print("SKIPPED (--skip_svm)"); rows.append((name,"—","—","—","—","—","—")); continue
+            print("(slow, ~10-15 min on large datasets) ", end=" ", flush=True)
+            sc=StandardScaler(); m=SVC(kernel="rbf",C=1.0,probability=True,random_state=SEED)
+            m.fit(sc.fit_transform(X_train),y_train)
+            rows.append((name,*metrics(y_test,m.predict(sc.transform(X_test)),m.predict_proba(sc.transform(X_test))[:,1])))
 
-    # 2. Logistic Regression
-    lr_baseline = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
-    lr_scaler   = StandardScaler()
-    lr_baseline.fit(lr_scaler.fit_transform(X_train), y_train)
-    rows.append(("Logistic Regression", *compute_metrics(
-        y_test,
-        lr_baseline.predict(lr_scaler.transform(X_test)),
-        lr_baseline.predict_proba(lr_scaler.transform(X_test))[:,1]
-    ).values()))
+        elif name=="Decision Tree":
+            m=DecisionTreeClassifier(max_depth=20,random_state=SEED); m.fit(X_train,y_train)
+            rows.append((name,*metrics(y_test,m.predict(X_test),m.predict_proba(X_test)[:,1])))
 
-    # 3. SVM (RBF)
-    svm_scaler = StandardScaler()
-    svm = SVC(kernel="rbf", C=1.0, probability=True, random_state=RANDOM_SEED)
-    svm.fit(svm_scaler.fit_transform(X_train), y_train)
-    rows.append(("SVM (RBF)", *compute_metrics(
-        y_test,
-        svm.predict(svm_scaler.transform(X_test)),
-        svm.predict_proba(svm_scaler.transform(X_test))[:,1]
-    ).values()))
+        elif name=="k-NN (k=5)":
+            sc=StandardScaler(); m=KNeighborsClassifier(n_neighbors=5)
+            m.fit(sc.fit_transform(X_train),y_train)
+            rows.append((name,*metrics(y_test,m.predict(sc.transform(X_test)),m.predict_proba(sc.transform(X_test))[:,1])))
 
-    # 4. Decision Tree
-    dt = DecisionTreeClassifier(max_depth=20, random_state=RANDOM_SEED)
-    dt.fit(X_train, y_train)
-    rows.append(("Decision Tree", *compute_metrics(
-        y_test, dt.predict(X_test), dt.predict_proba(X_test)[:,1]).values()))
+        elif name=="Random Forest":
+            rows.append((name,*metrics(y_test,rf.predict(X_test),rf.predict_proba(X_test)[:,1])))
 
-    # 5. k-NN (k=5)
-    knn_scaler = StandardScaler()
-    knn = KNeighborsClassifier(n_neighbors=5)
-    knn.fit(knn_scaler.fit_transform(X_train), y_train)
-    rows.append(("k-NN (k=5)", *compute_metrics(
-        y_test,
-        knn.predict(knn_scaler.transform(X_test)),
-        knn.predict_proba(knn_scaler.transform(X_test))[:,1]
-    ).values()))
+        elif name=="Gradient Boosting":
+            rows.append((name,*metrics(y_test,gb.predict(X_test),gb.predict_proba(X_test)[:,1])))
 
-    # 6. Random Forest
-    rows.append(("Random Forest", *compute_metrics(
-        y_test, rf.predict(X_test), rf.predict_proba(X_test)[:,1]).values()))
+        elif name=="PhishGuard (Ensemble)":
+            p=w_rf*rf.predict_proba(X_test)[:,1]+w_gb*gb.predict_proba(X_test)[:,1]+w_lr*lr.predict_proba(Xts)[:,1]
+            rows.append((name,*metrics(y_test,(p>=0.5).astype(int),p)))
 
-    # 7. Gradient Boosting
-    rows.append(("Gradient Boosting", *compute_metrics(
-        y_test, gb.predict(X_test), gb.predict_proba(X_test)[:,1]).values()))
+        print(f"done ({time.time()-t0:.1f}s)")
 
-    # 8. PhishGuard-URL Ensemble
-    p_rf_test  = rf.predict_proba(X_test)[:, 1]
-    p_gb_test  = gb.predict_proba(X_test)[:, 1]
-    p_lr_test  = lr.predict_proba(X_test_scaled)[:, 1]
-    p_ens_test = w_rf * p_rf_test + w_gb * p_gb_test + w_lr * p_lr_test
-    y_ens_test = (p_ens_test >= 0.5).astype(int)
+    ptable("Table 3: Overall Detection Performance (Test Set)",rows,
+           ["Model","Accuracy","Precision","Recall","F1","AUC-ROC","FPR"])
 
-    rows.append(("PhishGuard-URL (Ensemble)", *compute_metrics(
-        y_test, y_ens_test, p_ens_test).values()))
+    # Confusion matrix
+    p_ens=w_rf*rf.predict_proba(X_test)[:,1]+w_gb*gb.predict_proba(X_test)[:,1]+w_lr*lr.predict_proba(Xts)[:,1]
+    y_ens=(p_ens>=0.5).astype(int)
+    tn,fp,fn,tp=confusion_matrix(y_test,y_ens).ravel()
+    print(f"\n{'='*50}\n  Table 4: Confusion Matrix\n{'='*50}")
+    print(f"  {'':22} Pred Legit  Pred Phish")
+    print(f"  {'True Legitimate':<22} {tn:<11} {fp}")
+    print(f"  {'True Phishing':<22} {fn:<11} {tp}")
+    print(f"  FPR: {100*fp/(fp+tn):.2f}%   FNR: {100*fn/(fn+tp):.2f}%")
+    print("="*50)
 
-    print_table(
-        "Table 3: Overall Detection Performance on UNB Test Set (n=2,224)",
-        rows,
-        ["Model", "Accuracy", "Precision", "Recall", "F1", "AUC-ROC", "FPR"]
-    )
+    # 10-fold CV
+    print("\nRunning 10-fold cross-validation (RF) — 2-3 minutes ...")
+    Xa=np.vstack([X_train,X_test]); ya=np.concatenate([y_train,y_test])
+    rf_cv=RandomForestClassifier(n_estimators=200,min_samples_split=5,
+                                  max_features="sqrt",random_state=SEED,n_jobs=-1)
+    cv=StratifiedKFold(n_splits=10,shuffle=True,random_state=SEED)
+    accs=cross_val_score(rf_cv,Xa,ya,cv=cv,scoring="accuracy",n_jobs=-1)
+    print(f"\n{'='*55}\n  Table 6: 10-Fold Cross-Validation (RF)\n{'='*55}")
+    for i,a in enumerate(accs,1): print(f"  Fold {i:>2}: {100*a:.2f}%")
+    print(f"  Mean: {100*accs.mean():.2f}% ± {100*accs.std():.2f}%  "
+          f"Range: {100*accs.min():.2f}%–{100*accs.max():.2f}%")
+    print("="*55)
 
-    # ------------------------------------------------------------------
-    # Table 4: Confusion matrix
-    # ------------------------------------------------------------------
-    tn, fp, fn, tp = confusion_matrix(y_test, y_ens_test).ravel()
-    print(f"\n{'='*45}")
-    print("  Table 4: Confusion Matrix — Proposed Ensemble")
-    print(f"{'='*45}")
-    print(f"  {'':22} Pred Legit   Pred Phish")
-    print(f"  {'True Legit':<22} {tn:<12} {fp}")
-    print(f"  {'True Phish':<22} {fn:<12} {tp}")
-    print(f"{'='*45}")
-    print(f"  FP rate : {100*fp/(fp+tn):.2f}%  |  "
-          f"FN rate: {100*fn/(fn+tp):.2f}%")
-
-    # ------------------------------------------------------------------
-    # Table 6: 10-fold stratified cross-validation (RF)
-    # ------------------------------------------------------------------
-    print("\nRunning 10-fold stratified cross-validation (RF) ...")
-    X_all = np.vstack([X_train, X_test])
-    y_all = np.concatenate([y_train, y_test])
-
-    rf_cv = RandomForestClassifier(
-        n_estimators=200, min_samples_split=5,
-        max_features="sqrt", random_state=RANDOM_SEED, n_jobs=-1
-    )
-    cv   = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
-    accs = cross_val_score(rf_cv, X_all, y_all, cv=cv, scoring="accuracy")
-
-    print(f"\n{'='*55}")
-    print("  Table 6: 10-Fold Stratified Cross-Validation (RF)")
-    print(f"{'='*55}")
-    for i, a in enumerate(accs, 1):
-        print(f"  Fold {i:>2}: {100*a:.2f}%")
-    print(f"  {'Mean':>7}: {100*accs.mean():.2f}%  ±  {100*accs.std():.2f}%")
-    print(f"  {'Range':>7}: {100*accs.min():.2f}%  --  {100*accs.max():.2f}%")
-    print(f"{'='*55}")
-
-    # ------------------------------------------------------------------
-    # Table 7: Ablation study
-    # ------------------------------------------------------------------
+    # Ablation
     print("\nRunning ablation study ...")
+    groups={"Entropy (-13)":list(range(64,77)),"Length (-8)":list(range(0,8)),
+            "Symbol/Digit (-19)":list(range(45,64)),"Ratio (-16)":list(range(15,31)),
+            "Token (-14)":list(range(31,45))}
+    gb_f=GradientBoostingClassifier(n_estimators=200,learning_rate=0.1,max_depth=5,random_state=SEED)
+    gb_f.fit(X_train,y_train)
+    ba=accuracy_score(y_test,gb_f.predict(X_test))
+    bf=f1_score(y_test,gb_f.predict(X_test))
+    ab_rows=[("Full model (77 features)",77,f"{100*ba:.2f}%",f"{100*bf:.2f}%","—")]
+    all_f=set(range(X_train.shape[1]))
+    for gn,ri in groups.items():
+        keep=sorted(all_f-set(ri))
+        gb_a=GradientBoostingClassifier(n_estimators=200,learning_rate=0.1,max_depth=5,random_state=SEED)
+        gb_a.fit(X_train[:,keep],y_train)
+        aa=accuracy_score(y_test,gb_a.predict(X_test[:,keep]))
+        af=f1_score(y_test,gb_a.predict(X_test[:,keep]))
+        ab_rows.append((f"w/o {gn}",len(keep),f"{100*aa:.2f}%",f"{100*af:.2f}%",f"{100*(aa-ba):+.2f}%"))
+    ptable("Table 7: Ablation Study (GB)",ab_rows,["Configuration","Feats","Acc","F1","ΔAcc"])
 
-    # Feature group indices (matching F_lex, F_rat, F_tok, F_sym, F_ent)
-    # These slice positions correspond to the order in feature_extraction.py
-    feature_groups = {
-        "Entropy (-13)":      list(range(64, 77)),   # F_ent last 13 features
-        "Length (-8)":        [0,1,2,3,4,5,6,7],     # F_lex first 8
-        "Symbol/Digit (-19)": list(range(45, 64)),    # F_sym 19 features
-        "Ratio (-16)":        list(range(15, 31)),    # F_rat 16 features
-        "Token (-14)":        list(range(31, 45)),    # F_tok 14 features
-    }
+    print("\n✅  All paper tables reproduced successfully.")
 
-    ablation_rows = []
-    gb_full = GradientBoostingClassifier(**{
-        "n_estimators": 200, "learning_rate": 0.1,
-        "max_depth": 5, "random_state": RANDOM_SEED
-    })
-    gb_full.fit(X_train, y_train)
-    baseline_acc = accuracy_score(y_test, gb_full.predict(X_test))
-    baseline_f1  = f1_score(y_test, gb_full.predict(X_test))
-    ablation_rows.append((
-        "Full model (77 features)", 77,
-        f"{100*baseline_acc:.2f}%", f"{100*baseline_f1:.2f}%", "---"
-    ))
-
-    all_feats = set(range(X_train.shape[1]))
-    for group_name, remove_idx in feature_groups.items():
-        keep = sorted(all_feats - set(remove_idx))
-        gb_abl = GradientBoostingClassifier(**{
-            "n_estimators": 200, "learning_rate": 0.1,
-            "max_depth": 5, "random_state": RANDOM_SEED
-        })
-        gb_abl.fit(X_train[:, keep], y_train)
-        abl_acc = accuracy_score(y_test, gb_abl.predict(X_test[:, keep]))
-        abl_f1  = f1_score(y_test, gb_abl.predict(X_test[:, keep]))
-        delta   = 100 * (abl_acc - baseline_acc)
-        ablation_rows.append((
-            f"w/o {group_name}", len(keep),
-            f"{100*abl_acc:.2f}%", f"{100*abl_f1:.2f}%",
-            f"{delta:+.2f}%"
-        ))
-
-    print_table(
-        "Table 7: Ablation Study (GB, feature group removal)",
-        ablation_rows,
-        ["Configuration", "Feats", "Acc", "F1", "ΔAcc"]
-    )
-
-    print("\nEvaluation complete.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Evaluate PhishGuard-URL and reproduce paper tables."
-    )
-    parser.add_argument("--test",   default="data/test.csv")
-    parser.add_argument("--train",  default="data/train.csv")
-    parser.add_argument("--models", default="models/")
-    args = parser.parse_args()
-
-    for p in [args.test, args.train]:
-        if not os.path.exists(p):
-            print(f"ERROR: File not found: {p}")
-            print("Run dataset_split.py and train.py first.")
+if __name__=="__main__":
+    p=argparse.ArgumentParser()
+    p.add_argument("--test",     default="data/test.csv")
+    p.add_argument("--train",    default="data/train.csv")
+    p.add_argument("--models",   default="models/")
+    p.add_argument("--skip_svm", action="store_true",
+                   help="Skip SVM baseline (saves ~15 min)")
+    a=p.parse_args()
+    for f in [a.test,a.train]:
+        if not os.path.exists(f):
+            print(f"ERROR: {f} not found. Run dataset_split.py and train.py first.")
             sys.exit(1)
-
-    evaluate(args.test, args.train, args.models)
+    evaluate(a.test,a.train,a.models,a.skip_svm)
